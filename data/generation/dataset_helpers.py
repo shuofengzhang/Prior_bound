@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 import torchvision as tv
 
-from .experiment_config import Config, DatasetType, HParams, LossType
+from .experiment_config import Config, DatasetType, HParams, LossType, ModelType
 
 
 def get_dataloaders(hparams: HParams, config: Config, device: torch.device) -> Tuple[DataLoader, DataLoader, DataLoader]:
@@ -28,6 +28,10 @@ def get_dataloaders(hparams: HParams, config: Config, device: torch.device) -> T
         dataset = EMNIST_binary
     elif hparams.dataset_type == DatasetType.PCAM:
         dataset = PCAM
+    elif hparams.dataset_type == DatasetType.FashionMNIST:
+        dataset = FashionMNIST
+    elif hparams.dataset_type == DatasetType.MNIST:
+        dataset = MNIST
 
     else:
         raise KeyError
@@ -84,7 +88,12 @@ def process_data(hparams: HParams, data_np: np.ndarray, targets_np: np.ndarray, 
 
     # Numpy -> Torch
     data = torch.tensor(data_np, dtype=torch.float32) # Memory checkpoint
-    targets = torch.tensor(targets_np, dtype=torch.float32)
+
+    # Modified 15 Aug 2024
+    if hparams.dataset_type.K != 1:
+        targets = torch.tensor(targets_np, dtype=torch.long)
+    else:
+        targets = torch.tensor(targets_np, dtype=torch.float32)
 
     # Resize dataset
     dataset_size, offset = (hparams.train_dataset_size, 0) if train else (hparams.test_dataset_size, 1)
@@ -239,6 +248,17 @@ class MNIST_binary(tv.datasets.MNIST):
         return self.data[index], self.targets[index]
 
 
+class MNIST(tv.datasets.MNIST):
+    def __init__(self, hparams: HParams, config: Config, device: torch.device, *args, **kwargs):
+        super().__init__(config.data_dir, *args, **kwargs)
+        self.data = np.expand_dims(self.data, -1) # NHW -> NHWC
+        self.data, self.targets = process_data(hparams, self.data, np.array(self.targets),
+                device, self.train, binary=False)
+
+    def __getitem__(self, index):
+        return self.data[index], self.targets[index]
+
+
 class FashionMNIST_binary(tv.datasets.FashionMNIST):
     def __init__(self, hparams: HParams, config: Config, device: torch.device, *args, **kwargs):
         super().__init__(config.data_dir, *args, **kwargs)
@@ -249,6 +269,15 @@ class FashionMNIST_binary(tv.datasets.FashionMNIST):
     def __getitem__(self, index):
         return self.data[index], self.targets[index]
 
+class FashionMNIST(tv.datasets.FashionMNIST):
+    def __init__(self, hparams: HParams, config: Config, device: torch.device, *args, **kwargs):
+        super().__init__(config.data_dir, *args, **kwargs)
+        self.data = np.expand_dims(self.data, -1) # NHW -> NHWC
+        self.data, self.targets = process_data(hparams, self.data, np.array(self.targets),
+                device, self.train, binary=False)
+
+    def __getitem__(self, index):
+        return self.data[index], self.targets[index]
 
 class KMNIST_binary(tv.datasets.KMNIST):
     def __init__(self, hparams: HParams, config: Config, device: torch.device, *args, **kwargs):

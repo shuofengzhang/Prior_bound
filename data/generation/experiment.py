@@ -138,6 +138,14 @@ class Experiment:
             self.scheduler = torch.optim.lr_scheduler.ExponentialLR(
                     #self.optimizer, self.hparams.lr_gamma, verbose=True)
                     self.optimizer, self.hparams.lr_gamma)
+        elif self.hparams.lr_step_decay == True:
+            self.scheduler = torch.optim.lr_scheduler.StepLR(
+                    self.optimizer, self.hparams.lr_step_decay_size,
+                    self.hparams.lr_step_decay_gamma
+                    )
+        elif self.hparams.lr_cosineannealing == True:
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    self.optimizer, T_max=self.hparams.epochs)
         else:
             self.scheduler = None
 
@@ -168,7 +176,7 @@ class Experiment:
                     hparams.intermediate_pooling_type,
                     hparams.pooling,
                     hparams.dataset_type)
-        elif hparams.model_type == ModelType.RESNET50:
+        elif hparams.model_type in [ModelType.RESNET50, ModelType.RESNET50_WO_REPARAM]:
             return ResNet50(hparams.dataset_type)
         elif hparams.model_type == ModelType.DENSENET121:
             return DenseNet121(hparams.dataset_type)
@@ -252,6 +260,8 @@ class Experiment:
             if ckpt['state'].converged == True:
                 # print("Checkpoint file found but already converged. Fresh start.")
                 print("Checkpoint file found but already converged. Loading model...")
+                print("Loading state...")
+                self.state = ckpt['state']
             else:
                 print("Checkpoint file found and not converged, loading model...")
             self.model.load_state_dict(ckpt['model'])
@@ -259,8 +269,9 @@ class Experiment:
             self.init_model.load_state_dict(ckpt['init_model'])
             print("Loading optimizer")
             self.optimizer.load_state_dict(ckpt['optimizer'])
-            print("Loading scheduler")
-            self.scheduler.load_state_dict(ckpt['scheduler'])
+            if self.scheduler != None:
+                print("Loading scheduler")
+                self.scheduler.load_state_dict(ckpt['scheduler'])
 
         except FileNotFoundError:
             print("No checkpoint file (%s) found. Fresh start." % self.hparams.md5)
@@ -288,8 +299,14 @@ class Experiment:
             self.optimizer.zero_grad()
 
             logits = self.model(data).squeeze(-1)
+
+            # Modified 15 Aug 2024
             if self.hparams.loss == LossType.CE:
-                cross_entropy = F.binary_cross_entropy_with_logits(logits, target)
+                #if self.hparams.model_type == ModelType.NiN:
+                if self.hparams.dataset_type.K != 1:
+                    cross_entropy = F.cross_entropy(logits, target)
+                else:
+                    cross_entropy = F.binary_cross_entropy_with_logits(logits, target)
                 cross_entropy.backward()
                 loss = cross_entropy.clone()
             elif  self.hparams.loss == LossType.MSE:
@@ -302,10 +319,11 @@ class Experiment:
             self.optimizer.step()
 
             if self.scheduler != None:
-                self.scheduler.step()
-            if self.hparams.optimizer_type == OptimizerType.SGD_MOMENTUM_WD:
-                # exponentially decreasing the WD lambda
-                self.optimizer.param_groups[0]['weight_decay'] *= 1/self.hparams.lr_gamma
+                if self.scheduler.__class__.__name__ == "ExponentialLR":
+                    self.scheduler.step()
+                    if self.hparams.optimizer_type == OptimizerType.SGD_MOMENTUM_WD:
+                        # exponentially decreasing the WD lambda
+                        self.optimizer.param_groups[0]['weight_decay'] *= 1/self.hparams.lr_gamma
 
 
             # Log everything
@@ -337,7 +355,8 @@ class Experiment:
                             self.state.check_freq += 1
                             # if passed one milestone, double the check frequency
                             if self.config.save_epoch_freq is not None:
-                                self.save_state(f'_acc_{passed_milestone}')
+                                pass
+                                #self.save_state(f'_acc_{passed_milestone}')
 
                 else:
                     # loss function stopping check (CE or MSE)
@@ -360,7 +379,8 @@ class Experiment:
                                 self.state.check_freq += 1
                                 # if passed one milestone, double the ce check frequency
                                 if self.config.save_epoch_freq is not None:
-                                    self.save_state(f'_ce_{passed_milestone}')
+                                    pass
+                                    #self.save_state(f'_ce_{passed_milestone}')
                     elif self.hparams.loss == LossType.MSE:
                         dataset_mse, train_acc = self.evaluate_mse(DatasetSubsetType.TRAIN,
                                 log=is_last_batch)[:2]
@@ -381,50 +401,67 @@ class Experiment:
                                 self.state.check_freq += 1
                                 # if passed one milestone, double the ce check frequency
                                 if self.config.save_epoch_freq is not None:
-                                    self.save_state(f'_mse_{passed_milestone}')
+                                    pass
+                                    #self.save_state(f'_mse_{passed_milestone}')
 
             if self.state.converged:
                 break
-        #if self.scheduler != None:
-        #    self.scheduler.step()
+        if self.scheduler != None:
+            if self.scheduler.__class__.__name__ in [
+                    "StepLR", "CosineAnnealingLR"]:
+                self.scheduler.step()
 
     def train(self) -> None:
         self.printer.train_start(self.device)
         train_eval, val_eval = None, None
 
         self.state.global_batch = 0
-        for epoch in trange(self.state.epoch, self.hparams.epochs + 1, disable=(not self.config.use_tqdm)):
-            self.state.epoch = epoch
-            self._train_epoch()
 
-            is_evaluation_epoch = (
-                epoch == 1 or epoch == self.hparams.epochs or epoch % self.config.log_epoch_freq == 0)
-            if is_evaluation_epoch or self.state.converged:
-                train_eval = self.evaluate(
-                    DatasetSubsetType.TRAIN, (epoch == self.hparams.epochs or self.state.converged))
+        # If the loaded model is already converged
+        if self.state.converged:
+            print("Loaded model is already converged. Skip training...")
+            train_eval = self.evaluate(
+                DatasetSubsetType.TRAIN, self.state.converged)
 
-                val_eval = self.evaluate(DatasetSubsetType.TEST)
-                self.logger.log_generalization_gap(
-                    self.state, train_eval.acc, val_eval.acc, train_eval.avg_loss, val_eval.avg_loss, train_eval.all_complexities)
-                self.printer.epoch_metrics(epoch, train_eval, val_eval)
+            val_eval = self.evaluate(DatasetSubsetType.TEST)
+            self.logger.log_generalization_gap(
+                self.state, train_eval.acc, val_eval.acc, train_eval.avg_loss, val_eval.avg_loss, train_eval.all_complexities)
+            self.printer.epoch_metrics(self.state.epoch, train_eval, val_eval)
+            self.result_save_callback(self.state.epoch, val_eval, train_eval)
 
-            if epoch == self.hparams.epochs or self.state.converged:
-                self.result_save_callback(epoch, val_eval, train_eval)
+        else:
+            for epoch in trange(self.state.epoch, self.hparams.epochs + 1, disable=(not self.config.use_tqdm)):
+                self.state.epoch = epoch
+                self._train_epoch()
 
-            # Save state
-            is_save_epoch = self.config.save_epoch_freq is not None and (
-                epoch % self.config.save_epoch_freq == 0 or epoch == self.hparams.epochs or self.state.converged)
-            if is_save_epoch:
-                self.save_state()
+                is_evaluation_epoch = (
+                    epoch == 1 or epoch == self.hparams.epochs or epoch % self.config.log_epoch_freq == 0)
+                if is_evaluation_epoch or self.state.converged:
+                    train_eval = self.evaluate(
+                        DatasetSubsetType.TRAIN, (epoch == self.hparams.epochs or self.state.converged))
 
-            if self.state.converged:
-                print('Converged')
-                break
+                    val_eval = self.evaluate(DatasetSubsetType.TEST)
+                    self.logger.log_generalization_gap(
+                        self.state, train_eval.acc, val_eval.acc, train_eval.avg_loss, val_eval.avg_loss, train_eval.all_complexities)
+                    self.printer.epoch_metrics(epoch, train_eval, val_eval)
 
-        self.printer.train_end()
+                if epoch == self.hparams.epochs or self.state.converged:
+                    self.result_save_callback(epoch, val_eval, train_eval)
 
-        if train_eval is None or val_eval is None:
-            raise RuntimeError
+                # Save state
+                is_save_epoch = self.config.save_epoch_freq is not None and (
+                    epoch % self.config.save_epoch_freq == 0 or epoch == self.hparams.epochs or self.state.converged)
+                if is_save_epoch:
+                    self.save_state()
+
+                if self.state.converged:
+                    print('Converged')
+                    break
+
+            self.printer.train_end()
+
+            if train_eval is None or val_eval is None:
+                raise RuntimeError
 
     @torch.no_grad() # This will cause any future tensors
                      # (which are operations on current parameters, like weights*2)
@@ -477,11 +514,19 @@ class Experiment:
             data, target = data.to(self.device, non_blocking=True), target.to(
                 self.device, non_blocking=True)
             logits = self.model(data).squeeze(-1)
-            cross_entropy = F.binary_cross_entropy_with_logits(logits, target, reduction='sum')
+
+            # Modified 15 Aug 2024
+            if self.hparams.dataset_type.K != 1:
+                cross_entropy = F.cross_entropy(logits, target, reduction='sum')
+            else:
+                cross_entropy = F.binary_cross_entropy_with_logits(logits, target, reduction='sum')
             cross_entropy_loss += cross_entropy.item()  # sum up batch loss
 
             # get the index of the max logits
-            pred = logits.data > 0
+            if self.hparams.dataset_type.K != 1:
+                pred = logits.data.max(1, keepdim=True)[1]
+            else:
+                pred = logits.data > 0
             batch_correct = pred.eq(target.data.view_as(
                 pred)).type(torch.FloatTensor).cpu()
             num_correct += batch_correct.sum()

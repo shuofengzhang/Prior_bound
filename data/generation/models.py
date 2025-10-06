@@ -73,7 +73,7 @@ class NiN(ExperimentBaseModel):
 
         x = self.conv(x)
         x = self.bn(x)
-        # x = self.relu(x)
+        x = self.relu(x)
         # For single logit output need to remove the final relu
 
         x = self.avgpool(x)
@@ -81,6 +81,55 @@ class NiN(ExperimentBaseModel):
         return x.squeeze().unsqueeze(-1)
         # to match the shape of FCN outputs when there's only single output logit
         # (Although uncessary)
+
+class _NiN_pooling_size_helper(NiN):
+    r"""
+    Helping class to decide the size of feature map before the pooling layer
+    """
+    def __init__(self, depth: int, width: int, base_width: int, dataset_type: DatasetType) -> None:
+        super().__init__(depth, width, base_width, dataset_type)
+
+    def forward(self, x):
+        x = self.blocks(x)
+
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.relu(x)
+
+        return x
+
+
+class _NiN_path_norm_cal(NiN):
+    r"""
+    For Path norm calculation. Idea from paper
+    A PATH-NORM TOOLKIT FOR MODERN NETWORKS: CONSEQUENCES, PROMISES AND CHALLENGES
+    This class changes the pooling nodes (avg, max etc.) to avg_pool with proper rescaling
+    """
+    def __init__(self, depth: int, width: int, base_width: int, dataset_type: DatasetType,
+            feature_map_size, norm_type:str = "L2") -> None:
+        super().__init__(depth, width, base_width, dataset_type)
+
+        self.feature_map_size = feature_map_size
+        self.norm_type = norm_type
+
+        if self.norm_type == "L1":
+            self.avgpool = nn.AvgPool2d(self.feature_map_size, divisor_override=None)
+        elif self.norm_type == "L2":
+            self.avgpool = nn.AvgPool2d(self.feature_map_size, divisor_override=
+                    (self.feature_map_size[0]*self.feature_map_size[1])**2)
+
+    def forward(self, x):
+        x = self.blocks(x)
+
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.relu(x)
+
+        x = self.avgpool(x)
+
+        return x
+
+
 
 class NiN_binary(ExperimentBaseModel):
     def __init__(self, depth: int, width: int, base_width: int, dataset_type: DatasetType) -> None:
@@ -510,6 +559,32 @@ class ResNet(ExperimentBaseModel):
         return out
 
 
+class _ResNet_path_norm_cal(ResNet):
+    r"""
+    RseNet with the average pooling rescaled for correct path norm
+    calculation (see NiN_path_norm_cal)
+    """
+    def __init__(self, block, num_blocks, dataset_type, norm_type="L2"):
+        super().__init__(block, num_blocks, dataset_type)
+
+        self.norm_type = norm_type
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.layer4(out)
+        if self.norm_type == "L1":
+            out = F.avg_pool2d(out, 4)
+        elif self.norm_type == "L2":
+            out = F.avg_pool2d(out, 4, divisor_override=256)
+
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+        return out
+
+
 class ResNet_pop_fc(ResNet):
     r'''
     Last fc layer poped. For emperical kernal calculation.
@@ -532,6 +607,8 @@ class ResNet_pop_fc(ResNet):
 def ResNet50(dataset_type):
     return ResNet(Bottleneck, [3, 4, 6, 3], dataset_type)
 
+def _ResNet50_path_norm_cal(dataset_type, norm_type='L2'):
+    return _ResNet_path_norm_cal(Bottleneck, [3, 4, 6, 3], dataset_type)
 
 def ResNet_pop_fc_50(dataset_type):
     return ResNet_pop_fc(Bottleneck, [3, 4, 6, 3], dataset_type)
@@ -569,6 +646,25 @@ class _Transition(nn.Sequential):
         self.add_module('conv', nn.Conv2d(num_input_features, num_output_features,
                                           kernel_size=1, stride=1, bias=have_bias))
         self.add_module('pool', nn.AvgPool2d(kernel_size=2, stride=2))
+
+class _Transition_path_norm_cal(nn.Sequential):
+    r"""
+    AvgPool2d properly scaled for path norm calculation
+    """
+    def __init__(self, num_input_features, num_output_features,
+            have_bias, bn_momentum, bn_affine, norm_type='L2'):
+        super().__init__()
+        self.norm_type = norm_type
+        self.add_module('norm',
+                nn.BatchNorm2d(num_input_features, momentum=bn_momentum, affine=bn_affine))
+        self.add_module('relu', nn.ReLU(inplace=True))
+        self.add_module('conv', nn.Conv2d(num_input_features, num_output_features,
+                                          kernel_size=1, stride=1, bias=have_bias))
+
+        if norm_type == 'L1':
+            self.add_module('pool', nn.AvgPool2d(kernel_size=2, stride=2))
+        elif norm_type == 'L2':
+            self.add_module('pool', nn.AvgPool2d(kernel_size=2, stride=2, divisor_override=16))
 
 
 class _DenseLayer(nn.Module):
@@ -702,6 +798,97 @@ class DenseNet(ExperimentBaseModel):
         out = torch.flatten(out, 1)
         out = self.classifier(out)
         return out
+
+
+class _DenseNet_pooling_size_helper(DenseNet):
+    def __init__(self, dataset_type, growth_rate=32, block_config=(6, 12, 24, 16),
+                 num_init_features=64, bn_size=4, drop_rate=0, have_bias=True,
+                 bn_momentum=0.1):
+        super().__init__(dataset_type, growth_rate=growth_rate, block_config=block_config,
+                num_init_features=num_init_features, bn_size=bn_size, drop_rate=drop_rate,
+                have_bias=have_bias, bn_momentum=bn_momentum)
+
+    def forward(self, x):
+        features = self.features(x)
+        out = F.relu(features, inplace=True)
+        return out
+
+
+class _DenseNet_path_norm_cal(ExperimentBaseModel):
+    def __init__(self, dataset_type, feature_map_size, growth_rate=32, block_config=(6, 12, 24, 16),
+                 num_init_features=64, bn_size=4, drop_rate=0, have_bias=True,
+                 bn_momentum=0.1, bn_affine=True, norm_type='L2'):
+
+        super().__init__(dataset_type)
+
+        self.features = nn.Sequential(OrderedDict([
+            ('conv0', nn.Conv2d(dataset_type.D[0],
+                num_init_features, kernel_size=7, stride=2,
+                padding=5, bias=have_bias)) if dataset_type.D[-1] < 32 else
+            ('conv0', nn.Conv2d(dataset_type.D[0],
+                num_init_features, kernel_size=7, stride=2,
+                padding=3, bias=have_bias)),
+            ('norm0', nn.BatchNorm2d(num_init_features, momentum=bn_momentum, affine=bn_affine)),
+            ('relu0', nn.ReLU(inplace=True)),
+            ('pool0', nn.AvgPool2d(kernel_size=3, stride=2, padding=1, divisor_override=1)),
+            # From max pooling to a sum pooling. This does not need to scale with L1/L2 norm_type
+            # because the incoming weights for max pooling nodes are 1.
+        ]))
+
+        # Add multiple denseblocks based on config
+        # for densenet-121 config: [6,12,24,16]
+        num_features = num_init_features
+        for i, num_layers in enumerate(block_config):
+            block = _DenseBlock(
+                num_layers=num_layers,
+                num_input_features=num_features,
+                bn_size=bn_size,
+                growth_rate=growth_rate,
+                drop_rate=drop_rate,
+                have_bias=have_bias,
+                bn_momentum=bn_momentum,
+                bn_affine=bn_affine
+            )
+            self.features.add_module('denseblock%d' % (i + 1), block)
+            num_features = num_features + num_layers * growth_rate
+            if i != len(block_config) - 1:
+                # add transition layer between denseblocks to
+                # downsample
+                trans = _Transition_path_norm_cal(
+                        num_input_features=num_features,
+                                    num_output_features=num_features // 2,
+                                    have_bias=have_bias, bn_momentum=bn_momentum,
+                                    bn_affine=bn_affine,
+                                    norm_type=norm_type)
+                self.features.add_module('transition%d' % (i + 1), trans)
+                num_features = num_features // 2
+
+        # Final batch norm
+        self.features.add_module('norm5', nn.BatchNorm2d(num_features,
+            momentum=bn_momentum, affine=bn_affine))
+
+        # Linear layer
+        self.classifier = nn.Linear(num_features, dataset_type.K)
+
+        self.feature_map_size = feature_map_size
+        self.norm_type = norm_type
+
+        # No need for he_init because it's taking the trained model's weights
+
+
+    def forward(self, x):
+        features = self.features(x)
+        out = F.relu(features, inplace=True)
+        #out = F.adaptive_avg_pool2d(out, (1, 1))
+        if self.norm_type == 'L1':
+            out = F.avg_pool2d(out, self.feature_map_size)
+        elif self.norm_type == 'L2':
+            out = F.avg_pool2d(out, self.feature_map_size,
+                    divisor_override=(self.feature_map_size[0]*self.feature_map_size[1])**2)
+        out = torch.flatten(out, 1)
+        out = self.classifier(out)
+        return out
+
 
 class DenseNet_fc_popped(DenseNet):
 

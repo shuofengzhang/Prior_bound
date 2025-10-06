@@ -12,7 +12,7 @@ from torch.utils.data.dataloader import DataLoader
 
 from .experiment_config import ComplexityType as CT
 from .experiment_config import ModelType, LossType, HParams
-from .models import ExperimentBaseModel
+from .models import ExperimentBaseModel, _NiN_pooling_size_helper, _NiN_path_norm_cal, _ResNet50_path_norm_cal, _DenseNet_pooling_size_helper, _DenseNet_path_norm_cal
 from .empirical_kernel import empirical_K
 from .fc_kernel import *
 from .GP_prob.GP_prob_gpy2 import GP_prob, nngp_Heaviside_likelihood_posterior
@@ -252,6 +252,50 @@ def _pacbayes_sigma(
     return sigma
 
 
+def _pacbayes_sigma_multiclass(
+    model: ExperimentBaseModel,
+      dataloader: DataLoader,
+      accuracy: float,
+      seed: int,
+      magnitude_eps: Optional[float] = None,
+      search_depth: int = 15,
+      montecarlo_samples: int = 10,
+      accuracy_displacement: float = 0.1,
+      displacement_tolerance: float = 1e-2,
+    ) -> float:
+      lower, upper = 0, 2
+      sigma = 1
+
+      BIG_NUMBER = 10348628753
+      device = next(model.parameters()).device
+      rng = torch.Generator(device=device) if magnitude_eps is not None else torch.Generator()
+      rng.manual_seed(BIG_NUMBER + seed)
+
+      for _ in range(search_depth):
+        sigma = (lower + upper) / 2
+        accuracy_samples = []
+        for _ in range(montecarlo_samples):
+          with _perturbed_model(model, sigma, rng, magnitude_eps) as p_model:
+            loss_estimate = 0
+            for data, target in dataloader:
+              logits = p_model(data)
+              pred = logits.data.max(1, keepdim=True)[1]  # get the index of the max logits
+              batch_correct = pred.eq(target.data.view_as(pred)).type(torch.FloatTensor).cpu()
+              loss_estimate += batch_correct.sum()
+            loss_estimate /= len(dataloader.dataset)
+            accuracy_samples.append(loss_estimate)
+        displacement = abs(np.mean(accuracy_samples) - accuracy)
+        if abs(displacement - accuracy_displacement) < displacement_tolerance:
+          break
+        elif displacement > accuracy_displacement:
+          # Too much perturbation
+          upper = sigma
+        else:
+          # Not perturbed enough to reach target displacement
+          lower = sigma
+      return sigma
+
+
 @torch.no_grad()
 def get_all_measures(
     model: ExperimentBaseModel,
@@ -286,15 +330,128 @@ def get_all_measures(
 
     if model_type in [ModelType.FCN, ModelType.CNN, ModelType.RESNET50,
             ModelType.NiN, ModelType.FCN_SI]:
+        model_reparam = True
+        orig_model = deepcopy(model) # an reparam model used for path norm calculation
         model = _reparam(model)
         init_model = _reparam(init_model)
     elif model_type in [ModelType.DENSENET121, ModelType.DENSENET_WO_BIAS_121,
-            ModelType.DENSENET_WO_BIAS_121_S_INVAR]:
+            ModelType.DENSENET_WO_BIAS_121_S_INVAR,
+            ModelType.RESNET50_WO_REPARAM
+            ]:
+        model_reparam = False
         model = deepcopy(model)
         init_model = deepcopy(init_model)
+    else:
+        raise NotImplementedError
 
     device = next(model.parameters()).device
     m = len(trainNtest_loaders[0].dataset)
+
+    print("Path-norm")
+
+    def _path_norm(model: ExperimentBaseModel, norm_type:str=hparams.path_norm_type) -> Tensor:
+
+        def _inplace_bn_reparam(model):
+            # This function move the affine transformation of BN layers
+            # entirely into their weights and biases and set 
+            # running mean/var to be 0/1. This way the BN works
+            # exactly as an affine layer with learnable parameters, 
+            # which can be scaled later for path norm calculation.
+            for child in model.children():
+                _inplace_bn_reparam(child)
+                if child._get_name().startswith("BatchNorm"):
+                    scale = child.weight / ((child.running_var + child.eps).sqrt())
+                    # element wise operation. Here the BN weight/bias/running mean/
+                    # running var all have the same shape as a length-C vector, with
+                    # C being the number of channels of the input.
+                    child.weight.copy_(scale)
+                    child.bias.copy_(child.bias - scale * child.running_mean)
+                    child.running_mean.fill_(0)
+                    child.running_var.fill_(1)
+
+        if hparams.model_type in [ModelType.DENSENET_WO_BIAS_121_S_INVAR,
+                ModelType.FCN_S_INVAR,
+                ModelType.CNN,
+                ModelType.FCN_SI]:
+            raise NotImplementedError("The model type hasn't been dealt with regarding the pooling"
+                    " nodes for path norm calculation")
+        else:
+            x = torch.ones([1] + list(model.dataset_type.D), device=device)
+
+            #if hparams.model_type in [ModelType.DENSENET_WO_BIAS_121_S_INVAR,
+            #        ModelType.FCN_S_INVAR]: # Because the last layer is not trained.
+            #    for param in model.parameters():
+            #            param.data.pow_(2)
+            #    raise NotImplementedError("The model type hasn't been dealt with regarding the pooling"
+            #            "nodes for path norm calculation")
+            if hparams.model_type == ModelType.NiN:
+                size_helper_model = _NiN_pooling_size_helper(hparams.model_depth, hparams.model_width,
+                        hparams.base_width, hparams.dataset_type).to(device)
+                size_helper_model.eval()
+                shape = size_helper_model(x).shape
+                assert len(shape) == 4
+                feature_map_size = shape[2:]
+                del size_helper_model
+
+                path_norm_cal_model = _NiN_path_norm_cal(hparams.model_depth, hparams.model_width,
+                        hparams.base_width, hparams.dataset_type, feature_map_size,
+                        norm_type=norm_type).to(device)
+            elif hparams.model_type in [ModelType.RESNET50,
+                    ModelType.RESNET50_WO_REPARAM]:
+                path_norm_cal_model = _ResNet50_path_norm_cal(
+                        hparams.dataset_type, norm_type=norm_type).to(device)
+            elif hparams.model_type == ModelType.DENSENET_WO_BIAS_121:
+                size_helper_model = _DenseNet_pooling_size_helper(hparams.dataset_type,
+                        have_bias=False).to(device)
+                size_helper_model.eval()
+                shape = size_helper_model(x).shape
+                feature_map_size = shape[2:]
+                del size_helper_model
+
+                path_norm_cal_model = _DenseNet_path_norm_cal(hparams.dataset_type,
+                        feature_map_size, have_bias=False, norm_type=norm_type
+                        ).to(device)
+
+            elif hparams.model_type == ModelType.DENSENET121:
+                size_helper_model = _DenseNet_pooling_size_helper(hparams.dataset_type,
+                        have_bias=True).to(device)
+                size_helper_model.eval()
+                shape = size_helper_model(x).shape
+                feature_map_size = shape[2:]
+                del size_helper_model
+
+                path_norm_cal_model = _DenseNet_path_norm_cal(hparams.dataset_type,
+                        feature_map_size, have_bias=True, norm_type=norm_type
+                        ).to(device)
+
+            elif hparams.model_type == ModelType.FCN:
+                path_norm_cal_model = deepcopy(model)
+
+            path_norm_cal_model.load_state_dict(model.state_dict())
+            path_norm_cal_model.eval()
+            _inplace_bn_reparam(path_norm_cal_model)
+
+            if norm_type == "L1":
+                for param in path_norm_cal_model.parameters():
+                    if param.requires_grad:
+                        param.data.abs_()
+                out = path_norm_cal_model(x)
+                del path_norm_cal_model
+                return out.abs_().sum() # Raw L1 path norm
+            elif norm_type == "L2":
+                for param in path_norm_cal_model.parameters():
+                    if param.requires_grad:
+                        param.data.pow_(2)
+                out = path_norm_cal_model(x)
+                del path_norm_cal_model
+                return out.sum() # power square of L2 path norm
+
+    if model_reparam == True:
+        measures[CT.PATH_NORM] = _path_norm(orig_model)  # 44
+        del orig_model
+    else:
+        measures[CT.PATH_NORM] = _path_norm(model)
+
 
     def _get_xs_ys_from_dataset(dataset):
         loader = torch.utils.data.DataLoader(
@@ -561,36 +718,51 @@ def get_all_measures(
 
     print("Measures on the output of the network")
 
-    def _margin(
-        model: ExperimentBaseModel,
-        dataloader: DataLoader
-    ) -> Tensor:
-        # Is margin defined on single-output-logit NNs?
-        # I don't know. Here is how I'd do it.
-        # margin = |f(x)| * sgn(pred is correct)
-        # This is correct. But this implementation is ugly.
-        # can be more elegant by using something like
-        # target = 2 * target - 1
-        def _is_preds_are_correct(logits, target):
-            signs = torch.zeros(len(logits), device=target.device)
-            for i in range(len(logits)):
-                if ((target[i] == 1 and logits[i] > 0) or
-                    (target[i] == 0 and logits[i] <= 0)):
-                    signs[i] = 1.
-                elif ((target[i] == 1 and logits[i] <= 0) or
-                      (target[i] == 0 and logits[i] > 0)):
-                    signs[i] = -1.
-            return signs
+    if hparams.dataset_type.K != 1:
+        def _margin(
+            model: ExperimentBaseModel,
+            dataloader: DataLoader
+          ) -> Tensor:
+            margins = []
+            for data, target in dataloader:
+              logits = model(data).squeeze(-1)
+              correct_logit = logits[torch.arange(logits.shape[0]), target].clone()
+              logits[torch.arange(logits.shape[0]), target] = float('-inf')
+              max_other_logit = logits.data.max(1).values  # get the index of the max logits
+              margin = correct_logit - max_other_logit
+              margins.append(margin)
+            return torch.cat(margins).kthvalue(m // 10)[0]
+    else:
+        def _margin(
+            model: ExperimentBaseModel,
+            dataloader: DataLoader
+        ) -> Tensor:
+            # Is margin defined on single-output-logit NNs?
+            # I don't know. Here is how I'd do it.
+            # margin = |f(x)| * sgn(pred is correct)
+            # This is correct. But this implementation is ugly.
+            # can be more elegant by using something like
+            # target = 2 * target - 1
+            def _is_preds_are_correct(logits, target):
+                signs = torch.zeros(len(logits), device=target.device)
+                for i in range(len(logits)):
+                    if ((target[i] == 1 and logits[i] > 0) or
+                        (target[i] == 0 and logits[i] <= 0)):
+                        signs[i] = 1.
+                    elif ((target[i] == 1 and logits[i] <= 0) or
+                          (target[i] == 0 and logits[i] > 0)):
+                        signs[i] = -1.
+                return signs
 
-        if loss == LossType.MSE:
-            raise NotImplementedError(
-                "For MSE loss margin is problematic (because data labels are of +1/-1)")
-        margins = []
-        for data, target in dataloader:
-            logits = model(data).squeeze(-1)
-            margin = logits.abs() * _is_preds_are_correct(logits, target)
-            margins.append(margin)
-        return torch.cat(margins).kthvalue(m // 10)[0]
+            if loss == LossType.MSE:
+                raise NotImplementedError(
+                    "For MSE loss margin is problematic (because data labels are of +1/-1)")
+            margins = []
+            for data, target in dataloader:
+                logits = model(data).squeeze(-1)
+                margin = logits.abs() * _is_preds_are_correct(logits, target)
+                margins.append(margin)
+            return torch.cat(margins).kthvalue(m // 10)[0]
 
     if loss == LossType.CE:
         margin = _margin(model, trainNtest_loaders[0]).abs()
@@ -688,25 +860,6 @@ def get_all_measures(
     measures[CT.DIST_SPEC_INIT] = dist_spec_norms.sum()  # 41
     measures[CT.PARAM_NORM] = fro_norms.sum()  # 42
 
-    print("Path-norm")
-    # Adapted from https://github.com/bneyshabur/generalization-bounds/blob/master/measures.py#L98
-
-    def _path_norm(model: ExperimentBaseModel) -> Tensor:
-        model = deepcopy(model)
-        model.eval()
-        if hparams.model_type in [ModelType.DENSENET_WO_BIAS_121_S_INVAR,
-                ModelType.FCN_S_INVAR]:
-            for param in model.parameters():
-                    param.data.pow_(2)
-        else:
-            for param in model.parameters():
-                if param.requires_grad:
-                    param.data.pow_(2)
-
-        x = torch.ones([1] + list(model.dataset_type.D), device=device)
-        x = model(x)
-        del model
-        return x.sum()
 
     @torch.no_grad()
     def _get_margin_loss(model, dataloader, L):
@@ -729,6 +882,8 @@ def get_all_measures(
         model.eval()
         if model_type != ModelType.FCN:
             raise NotImplementedError("Path Norm bound only works for ReLU FCNs")
+        if hparams.dataset_type.K != 1:
+            raise NotImplementedError("Path Norm bound only works for ReLU binary FCN")
         # Rademacher complexity on the level set, when max data norm is 1
         R = 2.**(len(model.width_tuple)+1) * path_norm * torch.sqrt(
                 torch.log(torch.tensor(2.*model.input_dim))/m)
@@ -742,7 +897,7 @@ def get_all_measures(
             # print("Bound at L:", bound_L.item())
         return bound
 
-    measures[CT.PATH_NORM] = _path_norm(model)  # 44
+
 
     if loss == LossType.CE:
         measures[CT.PATH_NORM_OVER_MARGIN] = measures[CT.PATH_NORM] / \
@@ -751,11 +906,17 @@ def get_all_measures(
             raise NotImplementedError("Now the max of maximum norm of data samples is not 1!")
         elif model_type == ModelType.FCN:
             L_grid = np.arange(0.1, 1, 0.01)
-            measures[CT.PATH_NORM_BOUND] = _path_norm_bound(measures[CT.PATH_NORM], model, L_grid)
+            try:
+                measures[CT.PATH_NORM_BOUND] = _path_norm_bound(measures[CT.PATH_NORM], model, L_grid)
+            except:
+                pass
 
 
     print("Flatness-based measures")
-    sigma = _pacbayes_sigma(model, trainNtest_loaders[0], acc, seed)
+    if hparams.dataset_type.K != 1:
+        sigma = _pacbayes_sigma_multiclass(model, trainNtest_loaders[0], acc, seed)
+    else:
+        sigma = _pacbayes_sigma(model, trainNtest_loaders[0], acc, seed)
 
     def _pacbayes_bound(reference_vec: Tensor) -> Tensor:
         return (reference_vec.norm(p=2) ** 2) / (4 * sigma ** 2) + math.log(m / sigma) + 10
@@ -765,7 +926,10 @@ def get_all_measures(
 
     print("Magnitude-aware Perturbation Bounds")
     mag_eps = 1e-3
-    mag_sigma = _pacbayes_sigma(model, trainNtest_loaders[0], acc, seed, mag_eps)
+    if hparams.dataset_type.K != 1:
+        mag_sigma = _pacbayes_sigma_multiclass(model, trainNtest_loaders[0], acc, seed, mag_eps)
+    else:
+        mag_sigma = _pacbayes_sigma(model, trainNtest_loaders[0], acc, seed, mag_eps)
     omega = num_params
 
     def _pacbayes_mag_bound(reference_vec: Tensor) -> Tensor:
@@ -1062,6 +1226,8 @@ def get_all_measures(
                               "TEST_ACC_DET","PATH_NORM_BOUND",
                               "EPOCH_REACH_CE_0_01", "EPOCH_REACH_ACC_1"]:
             return value
+        elif measure.name == 'PATH_NORM' and hparams.path_norm_type == 'L1':
+            return value / np.sqrt(m)
         else:
             return np.sqrt(value / m)
     return {k: adjust_measure(k, v.item()) for k, v in measures.items()}

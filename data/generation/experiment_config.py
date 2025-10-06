@@ -1,4 +1,4 @@
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from enum import Enum, IntEnum
 import hashlib
 from pathlib import Path
@@ -16,6 +16,8 @@ class DatasetType(Enum):
     KMNIST_binary = (7, (1, 28, 28), 1)
     EMNIST_binary = (8, (1, 28, 28), 1)
     PCAM = (9, (3, 96, 96), 1)
+    FashionMNIST = (10, (1, 28, 28), 10)
+    MNIST = (11, (1, 28, 28), 10)
 
     def __init__(self, id: int, image_shape: Tuple[int, int, int], num_logits: int):
         self.D = image_shape
@@ -37,6 +39,7 @@ class ModelType(Enum):
     DENSENET_WO_BIAS_121 = 6
     DENSENET_WO_BIAS_121_S_INVAR = 7
     FCN_S_INVAR = 8
+    RESNET50_WO_REPARAM = 9
 
 class ComplexityType(Enum):
     # GP based Measures
@@ -149,9 +152,9 @@ class HParams:
     pooling: Optional[str] = "max" # can be "avg", "max"
 
     # for NiN
-    base_width: Optional[int] = None # for NiN defalut is 25
-    model_depth: Optional[int] = None # NiN default 2
-    model_width: Optional[int] = None # NiN default 8
+    base_width: Optional[int] = 25 # for NiN defalut is 25
+    model_depth: Optional[int] = 2 # NiN default 2
+    model_width: Optional[int] = 8 # NiN default 8
 
     # Dataset
     center_data: bool = False
@@ -186,8 +189,15 @@ class HParams:
     epochs: int = 300
     optimizer_type: OptimizerType = OptimizerType.ADAM
     lr: float = 0.01
+
     exp_incre_lr:bool = False
     lr_gamma:float = 1.02
+
+    lr_step_decay:bool = False
+    lr_step_decay_size: Optional[int] = 30
+    lr_step_decay_gamma: Optional[float] = 0.5
+
+    lr_cosineannealing:bool = False
 
     # Stopping criterion
     stop_by_full_train_acc: bool = True # Stop training when reaching 100% training accuracy
@@ -210,9 +220,14 @@ class HParams:
 
     # the above two criteriors would be neglected if stop_by_full_train_acc=True
 
+    # Path Norm type (L1 or L2)
+    #model_reparam: bool = True # For an accurate path norm calculation you should never reparam it,
+                               # as it alters the DAG and reduces the number of paths.
+    path_norm_type: str = 'L2'
+
     # GP measures related
     compute_prior: bool = False
-    compute_mar_lik: bool = True
+    compute_mar_lik: bool = False
     normalize_kernel: bool = False
     PU_MC: bool = False # Use MC method to calculate PU, as proposed in Jeremy v1
     PU_EP: bool = True
@@ -223,6 +238,14 @@ class HParams:
                                   # if None then 1.0
 
     optimize_PAC_Bayes_bound: bool = False
+
+    def __str__(self):
+        # Ignore all the fields that you don't want them to affect the hash
+        s = ', '.join(f'{field.name}={getattr(self, field.name)!r}'
+                  for field in fields(self)
+                  if field.name != 'model_reparam') # Put the name of field you want to ignore here
+        return f'{type(self).__name__}({s})'
+
 
     def to_tensorboard_dict(self) -> dict:
         d = asdict(self)
@@ -269,7 +292,8 @@ class Config:
 
     @property
     def checkpoint_dir(self):
-        return self.root_dir / 'checkpoints'
+        #return self.root_dir / 'checkpoints'
+        return Path('/mnt/extraspace/sofuncheung/Prior_bound/data/temp/checkpoints')
 
     @property
     def results_dir(self):
